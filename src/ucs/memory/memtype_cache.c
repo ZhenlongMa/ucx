@@ -40,14 +40,19 @@ typedef enum {
 } ucs_memtype_cache_action_t;
 
 struct ucs_memtype_cache_registration {
-    ucs_list_link_t            list;
-    ucs_pgt_addr_t             start;
-    ucs_pgt_addr_t             end;
-    ucs_memory_type_t          mem_type;
-    ucs_sys_device_t           sys_dev;
+    ucs_interval_map_node_t     interval;
+    ucs_list_link_t             list;
+    ucs_memory_type_t           mem_type;
+    ucs_sys_device_t            sys_dev;
     uint8_t                    mem_flags;
     ucs_memtype_cache_region_t *region;
+    size_t                     conflicts; /**< Nonmatching overlaps */
 };
+
+typedef struct {
+    ucs_memtype_cache_t              *cache;
+    ucs_memtype_cache_registration_t *registration;
+} ucs_memtype_cache_registration_ctx_t;
 
 #define UCS_MEMTYPE_CACHE_TOKEN_HASH_KEY(_token) \
     kh_int64_hash_func((uintptr_t)(_token))
@@ -61,7 +66,7 @@ struct ucs_memtype_cache_region {
     ucs_memory_type_t mem_type;      /**< Memory type, use uint8 for compact size */
     ucs_sys_device_t  sys_dev;       /**< System device index */
     uint8_t           mem_flags;     /**< UCS memory flags */
-    unsigned          explicit_refs; /**< Registrations sharing an explicit region */
+    ucs_list_link_t   registrations; /**< Registrations sharing this region */
 };
 
 
@@ -173,12 +178,12 @@ ucs_memtype_cache_insert(ucs_memtype_cache_t *memtype_cache,
     ucs_assert((start % UCS_PGT_ADDR_ALIGN) == 0);
     ucs_assert((end   % UCS_PGT_ADDR_ALIGN) == 0);
 
-    region->super.start   = start;
-    region->super.end     = end;
-    region->mem_type      = mem_type;
-    region->sys_dev       = sys_dev;
-    region->mem_flags     = mem_flags;
-    region->explicit_refs = 0;
+    region->super.start = start;
+    region->super.end   = end;
+    region->mem_type    = mem_type;
+    region->sys_dev     = sys_dev;
+    region->mem_flags   = mem_flags;
+    ucs_list_head_init(&region->registrations);
 
     status = UCS_PROFILE_CALL(ucs_pgtable_insert, &memtype_cache->pgtable,
                               &region->super);
@@ -210,83 +215,108 @@ ucs_memtype_cache_registrations_match(
         const ucs_memtype_cache_registration_t *a,
         const ucs_memtype_cache_registration_t *b)
 {
-    return (a->start == b->start) && (a->end == b->end) &&
+    return (a->interval.start == b->interval.start) &&
+           (a->interval.end == b->interval.end) &&
            (a->mem_type == b->mem_type) && (a->sys_dev == b->sys_dev) &&
            (a->mem_flags == b->mem_flags);
 }
 
-static int
-ucs_memtype_cache_registrations_conflict(
-        const ucs_memtype_cache_registration_t *a,
-        const ucs_memtype_cache_registration_t *b)
-{
-    return (a->start < b->end) && (b->start < a->end) &&
-           !ucs_memtype_cache_registrations_match(a, b);
-}
-
-/* The cache lock must be held. All registrations sharing this region lose their
- * cached entry together, so a conflicting mapping cannot leave a stale hit. */
+/* The cache lock must be held. Only registrations sharing this region need
+ * their cached entry cleared when a conflicting registration arrives. */
 static void
 ucs_memtype_cache_remove_explicit(ucs_memtype_cache_t *memtype_cache,
-                                  ucs_memtype_cache_region_t *region)
+                                 ucs_memtype_cache_region_t *region)
 {
-    ucs_memtype_cache_registration_t *registration;
+    ucs_memtype_cache_registration_t *registration, *tmp;
     ucs_status_t status;
 
     status = ucs_pgtable_remove(&memtype_cache->pgtable, &region->super);
     ucs_assertv_always(status == UCS_OK,
-                "failed to remove explicit memtype region: %s",
-                ucs_status_string(status));
+                      "failed to remove explicit memtype region: %s",
+                      ucs_status_string(status));
 
-    ucs_list_for_each(registration, &memtype_cache->registrations, list) {
-        if (registration->region == region) {
-            registration->region = NULL;
-        }
+    ucs_list_for_each_safe(registration, tmp, &region->registrations, list) {
+        ucs_list_del(&registration->list);
+        registration->region = NULL;
     }
     ucs_free(region);
 }
 
-/* The cache lock must be held. A partially overlapping registration makes the
- * whole region ambiguous; only exact duplicates with equal attributes may
- * share it. */
+/* The cache lock must be held. Conflict counts include uncached registrations,
+ * so restoring an entry never has to rescan its overlapping registrations. */
 static void
-ucs_memtype_cache_restore_registration(ucs_memtype_cache_t *memtype_cache,
+ucs_memtype_cache_restore_registration(
+        ucs_memtype_cache_t *memtype_cache,
         ucs_memtype_cache_registration_t *registration)
 {
-    ucs_memtype_cache_registration_t *other;
+    ucs_pgt_region_t *pgt_region;
 
-    ucs_assert((registration->start % UCS_PGT_ADDR_ALIGN) == 0);
-    ucs_assert((registration->end % UCS_PGT_ADDR_ALIGN) == 0);
-
-    if (registration->region != NULL) {
+    if ((registration->region != NULL) || (registration->conflicts != 0)) {
         return;
     }
 
-    ucs_list_for_each(other, &memtype_cache->registrations, list) {
-        if ((other != registration) &&
-            ucs_memtype_cache_registrations_conflict(registration, other)) {
+    pgt_region = ucs_pgtable_lookup(&memtype_cache->pgtable,
+                                   registration->interval.start);
+    if (pgt_region != NULL) {
+        /* With no conflicts, an existing region is an exact duplicate. */
+        ucs_assert(pgt_region->start == registration->interval.start);
+        ucs_assert(pgt_region->end == registration->interval.end);
+        registration->region = ucs_derived_of(pgt_region,
+                                             ucs_memtype_cache_region_t);
+    } else {
+        registration->region = ucs_memtype_cache_insert(
+                memtype_cache, registration->interval.start,
+                registration->interval.end, registration->mem_type,
+                registration->sys_dev, registration->mem_flags);
+        if (registration->region == NULL) {
             return;
         }
     }
 
-    ucs_list_for_each(other, &memtype_cache->registrations, list) {
-        if ((other != registration) && (other->region != NULL) &&
-            ucs_memtype_cache_registrations_match(registration, other)) {
-            registration->region = other->region;
-            ++registration->region->explicit_refs;
-            return;
-        }
+    ucs_list_add_tail(&registration->region->registrations,
+                      &registration->list);
+}
+
+static void
+ucs_memtype_cache_registration_add_overlap(ucs_interval_map_node_t *node,
+                                         void *arg)
+{
+    ucs_memtype_cache_registration_ctx_t *ctx = arg;
+    ucs_memtype_cache_registration_t *other = ucs_container_of(
+            node, ucs_memtype_cache_registration_t, interval);
+    ucs_memtype_cache_registration_t *registration = ctx->registration;
+
+    if (ucs_memtype_cache_registrations_match(registration, other)) {
+        return;
     }
 
-    registration->region = ucs_memtype_cache_insert(memtype_cache,
-                                                    registration->start,
-                                                    registration->end,
-                                                    registration->mem_type,
-                                                    registration->sys_dev,
-                                                    registration->mem_flags);
-    if (registration->region != NULL) {
-        registration->region->explicit_refs = 1;
+    ++registration->conflicts;
+    ++other->conflicts;
+    if (other->region != NULL) {
+        ucs_trace("memtype_cache: registration [0x%lx..0x%lx] "
+                  "conflicts with " UCS_MEMTYPE_CACHE_REGION_FMT,
+                  (unsigned long)registration->interval.start,
+                  (unsigned long)registration->interval.end,
+                  UCS_MEMTYPE_CACHE_REGION_ARG(other->region));
+        ucs_memtype_cache_remove_explicit(ctx->cache, other->region);
     }
+}
+
+static void
+ucs_memtype_cache_registration_remove_overlap(ucs_interval_map_node_t *node,
+                                            void *arg)
+{
+    ucs_memtype_cache_registration_ctx_t *ctx = arg;
+    ucs_memtype_cache_registration_t *other = ucs_container_of(
+            node, ucs_memtype_cache_registration_t, interval);
+
+    if (ucs_memtype_cache_registrations_match(ctx->registration, other)) {
+        return;
+    }
+
+    ucs_assert(other->conflicts > 0);
+    --other->conflicts;
+    ucs_memtype_cache_restore_registration(ctx->cache, other);
 }
 
 void ucs_memtype_cache_register(const void *address, size_t size,
@@ -295,7 +325,8 @@ void ucs_memtype_cache_register(const void *address, size_t size,
                                 const void *token)
 {
     ucs_pgt_addr_t start = (ucs_pgt_addr_t)address;
-    ucs_memtype_cache_registration_t *registration, *other;
+    ucs_memtype_cache_registration_t *registration;
+    ucs_memtype_cache_registration_ctx_t ctx;
     ucs_memtype_cache_t *memtype_cache;
     khiter_t hash_it;
     int ret;
@@ -321,13 +352,15 @@ void ucs_memtype_cache_register(const void *address, size_t size,
 
     /* The page table requires aligned regions, so cover the whole aligned
      * range. Neighboring allocations cannot share an aligned granule. */
-    registration->start     = ucs_align_down_pow2(start, UCS_PGT_ADDR_ALIGN);
-    registration->end       = ucs_align_up_pow2(start + size,
-                                                UCS_PGT_ADDR_ALIGN);
-    registration->mem_type  = mem_type;
-    registration->sys_dev   = sys_dev;
-    registration->mem_flags = mem_flags;
-    registration->region    = NULL;
+    registration->interval.start = ucs_align_down_pow2(start,
+                                                      UCS_PGT_ADDR_ALIGN);
+    registration->interval.end   = ucs_align_up_pow2(start + size,
+                                                    UCS_PGT_ADDR_ALIGN);
+    registration->mem_type       = mem_type;
+    registration->sys_dev        = sys_dev;
+    registration->mem_flags      = mem_flags;
+    registration->region         = NULL;
+    registration->conflicts      = 0;
 
     ucs_spin_lock(&memtype_cache->lock);
     hash_it = kh_put(ucs_memtype_cache_tokens, &memtype_cache->token_hash,
@@ -338,18 +371,16 @@ void ucs_memtype_cache_register(const void *address, size_t size,
     }
     kh_value(&memtype_cache->token_hash, hash_it) = registration;
 
-    ucs_list_for_each(other, &memtype_cache->registrations, list) {
-        if (ucs_memtype_cache_registrations_conflict(registration, other) &&
-            (other->region != NULL)) {
-            ucs_trace("memtype_cache: registration [0x%lx..0x%lx] "
-                      "conflicts with " UCS_MEMTYPE_CACHE_REGION_FMT,
-                      registration->start, registration->end,
-                      UCS_MEMTYPE_CACHE_REGION_ARG(other->region));
-            ucs_memtype_cache_remove_explicit(memtype_cache, other->region);
-        }
-    }
-
-    ucs_list_add_tail(&memtype_cache->registrations, &registration->list);
+    ctx.cache        = memtype_cache;
+    ctx.registration = registration;
+    ucs_interval_map_foreach_overlapping(
+            &memtype_cache->registrations, registration->interval.start,
+            registration->interval.end,
+            ucs_memtype_cache_registration_add_overlap, &ctx);
+    ucs_interval_map_insert(&memtype_cache->registrations,
+                            &registration->interval,
+                            registration->interval.start,
+                            registration->interval.end);
     ucs_memtype_cache_restore_registration(memtype_cache, registration);
     ucs_spin_unlock(&memtype_cache->lock);
     return;
@@ -362,8 +393,8 @@ out_unlock:
 void ucs_memtype_cache_unregister(const void *token)
 {
     ucs_memtype_cache_t *memtype_cache = ucs_memtype_cache_global_instance;
-    ucs_memtype_cache_registration_t *other, *found;
-    int restore_registrations;
+    ucs_memtype_cache_registration_t *found;
+    ucs_memtype_cache_registration_ctx_t ctx;
     khiter_t hash_it;
 
     if (memtype_cache == NULL || memtype_cache->has_events) {
@@ -378,20 +409,24 @@ void ucs_memtype_cache_unregister(const void *token)
     }
 
     found = kh_value(&memtype_cache->token_hash, hash_it);
-    restore_registrations = (found->region == NULL);
     kh_del(ucs_memtype_cache_tokens, &memtype_cache->token_hash, hash_it);
-    if ((found->region != NULL) &&
-        (--found->region->explicit_refs == 0)) {
-        ucs_memtype_cache_remove_explicit(memtype_cache, found->region);
-    }
-    ucs_list_del(&found->list);
-    ucs_free(found);
-
-    if (restore_registrations) {
-        ucs_list_for_each(other, &memtype_cache->registrations, list) {
-            ucs_memtype_cache_restore_registration(memtype_cache, other);
+    ucs_interval_map_remove(&memtype_cache->registrations, &found->interval);
+    if (found->region != NULL) {
+        ucs_list_del(&found->list);
+        if (ucs_list_is_empty(&found->region->registrations)) {
+            ucs_memtype_cache_remove_explicit(memtype_cache, found->region);
         }
     }
+
+    if (found->conflicts != 0) {
+        ctx.cache        = memtype_cache;
+        ctx.registration = found;
+        ucs_interval_map_foreach_overlapping(
+                &memtype_cache->registrations, found->interval.start,
+                found->interval.end,
+                ucs_memtype_cache_registration_remove_overlap, &ctx);
+    }
+    ucs_free(found);
 
 out_unlock:
     ucs_spin_unlock(&memtype_cache->lock);
@@ -551,7 +586,7 @@ static void ucs_memtype_cache_event_callback(ucm_event_type_t event_type,
 static void ucs_memtype_cache_purge(ucs_memtype_cache_t *memtype_cache)
 {
     ucs_memtype_cache_region_t *region, *tmp;
-    ucs_memtype_cache_registration_t *registration, *registration_tmp;
+    ucs_memtype_cache_registration_t *registration;
     UCS_LIST_HEAD(region_list);
 
     ucs_trace_func("memtype_cache purge");
@@ -562,11 +597,9 @@ static void ucs_memtype_cache_purge(ucs_memtype_cache_t *memtype_cache)
         ucs_free(region);
     }
 
-    ucs_list_for_each_safe(registration, registration_tmp,
-                           &memtype_cache->registrations, list) {
-        ucs_list_del(&registration->list);
+    kh_foreach_value(&memtype_cache->token_hash, registration, {
         ucs_free(registration);
-    }
+    });
     kh_destroy_inplace(ucs_memtype_cache_tokens, &memtype_cache->token_hash);
 }
 
@@ -639,7 +672,7 @@ static UCS_CLASS_INIT_FUNC(ucs_memtype_cache_t)
         goto err_destroy_rwlock;
     }
 
-    ucs_list_head_init(&self->registrations);
+    ucs_interval_map_init(&self->registrations);
     kh_init_inplace(ucs_memtype_cache_tokens, &self->token_hash);
     self->has_events = 0;
     status = ucm_set_event_handler(UCM_EVENT_MEM_TYPE_ALLOC |
